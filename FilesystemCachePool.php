@@ -1,144 +1,97 @@
 <?php
 
-/*
- * This file is part of php-cache organization.
- *
- * (c) 2015 Aaron Scherer <aequasi@gmail.com>, Tobias Nyholm <tobias.nyholm@gmail.com>
- *
- * This source file is subject to the MIT license that is bundled
- * with this source code in the file LICENSE.
- */
-
 namespace Cache\Adapter\Filesystem;
 
 use Cache\Adapter\Common\AbstractCachePool;
 use Cache\Adapter\Common\Exception\InvalidArgumentException;
 use Cache\Adapter\Common\PhpCacheItem;
-use League\Flysystem\FileExistsException;
-use League\Flysystem\FileNotFoundException;
-use League\Flysystem\FilesystemInterface;
+use League\Flysystem\FilesystemOperator;
+use League\Flysystem\FilesystemException;
 
-/**
- * @author Tobias Nyholm <tobias.nyholm@gmail.com>
- */
 class FilesystemCachePool extends AbstractCachePool
 {
-    /**
-     * @type FilesystemInterface
-     */
-    private $filesystem;
+    private FilesystemOperator $filesystem;
+    private string $folder;
 
-    /**
-     * The folder should not begin nor end with a slash. Example: path/to/cache.
-     *
-     * @type string
-     */
-    private $folder;
-
-    /**
-     * @param FilesystemInterface $filesystem
-     * @param string              $folder
-     */
-    public function __construct(FilesystemInterface $filesystem, $folder = 'cache')
+    public function __construct(FilesystemOperator $filesystem, string $folder = 'cache')
     {
-        $this->folder = $folder;
-
+        $this->folder = rtrim($folder, '/');
         $this->filesystem = $filesystem;
-        $this->filesystem->createDir($this->folder);
+
+        try {
+            $this->filesystem->createDirectory($this->folder);
+        } catch (FilesystemException $e) {
+            // Handle initialization errors if necessary
+        }
     }
 
-    /**
-     * @param string $folder
-     */
-    public function setFolder($folder)
+    public function setFolder(string $folder)
     {
-        $this->folder = $folder;
+        $this->folder = rtrim($folder, '/');
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function fetchObjectFromCache($key)
     {
         $empty = [false, null, [], null];
-        $file  = $this->getFilePath($key);
+        $file = $this->getFilePath($key);
 
         try {
-            $data = @unserialize($this->filesystem->read($file));
+            $data = unserialize($this->filesystem->read($file));
             if ($data === false) {
                 return $empty;
             }
-        } catch (FileNotFoundException $e) {
+        } catch (FilesystemException $e) {
             return $empty;
         }
 
-        // Determine expirationTimestamp from data, remove items if expired
         $expirationTimestamp = $data[2] ?: null;
         if ($expirationTimestamp !== null && time() > $expirationTimestamp) {
             foreach ($data[1] as $tag) {
                 $this->removeListItem($this->getTagKey($tag), $key);
             }
             $this->forceClear($key);
-
             return $empty;
         }
 
         return [true, $data[0], $data[1], $expirationTimestamp];
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function clearAllObjectsFromCache()
     {
-        $this->filesystem->deleteDir($this->folder);
-        $this->filesystem->createDir($this->folder);
+        try {
+            $this->filesystem->deleteDirectory($this->folder);
+            $this->filesystem->createDirectory($this->folder);
+        } catch (FilesystemException $e) {
+            return false;
+        }
 
         return true;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function clearOneObjectFromCache($key)
     {
         return $this->forceClear($key);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function storeItemInCache(PhpCacheItem $item, $ttl)
     {
-        $data = serialize(
-            [
-                $item->get(),
-                $item->getTags(),
-                $item->getExpirationTimestamp(),
-            ]
-        );
+        $data = serialize([
+            $item->get(),
+            $item->getTags(),
+            $item->getExpirationTimestamp(),
+        ]);
 
         $file = $this->getFilePath($item->getKey());
-        if ($this->filesystem->has($file)) {
-            // Update file if it exists
-            return $this->filesystem->update($file, $data);
-        }
 
         try {
-            return $this->filesystem->write($file, $data);
-        } catch (FileExistsException $e) {
-            // To handle issues when/if race conditions occurs, we try to update here.
-            return $this->filesystem->update($file, $data);
+            $this->filesystem->write($file, $data);
+        } catch (FilesystemException $e) {
+            return false;
         }
+
+        return true;
     }
 
-    /**
-     * @param string $key
-     *
-     * @throws InvalidArgumentException
-     *
-     * @return string
-     */
     private function getFilePath($key)
     {
         if (!preg_match('|^[a-zA-Z0-9_\.! ]+$|', $key)) {
@@ -148,66 +101,65 @@ class FilesystemCachePool extends AbstractCachePool
         return sprintf('%s/%s', $this->folder, $key);
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function getList($name)
     {
         $file = $this->getFilePath($name);
 
-        if (!$this->filesystem->has($file)) {
-            $this->filesystem->write($file, serialize([]));
+        try {
+            if (!$this->filesystem->fileExists($file)) {
+                $this->filesystem->write($file, serialize([]));
+            }
+            return unserialize($this->filesystem->read($file));
+        } catch (FilesystemException $e) {
+            return [];
         }
-
-        return unserialize($this->filesystem->read($file));
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function removeList($name)
     {
-        $file = $this->getFilePath($name);
-        $this->filesystem->delete($file);
+        try {
+            $this->filesystem->delete($this->getFilePath($name));
+        } catch (FilesystemException $e) {
+            // Ignore errors if file doesn't exist
+        }
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function appendListItem($name, $key)
     {
-        $list   = $this->getList($name);
+        $list = $this->getList($name);
         $list[] = $key;
 
-        return $this->filesystem->update($this->getFilePath($name), serialize($list));
+        try {
+            $this->filesystem->write($this->getFilePath($name), serialize($list));
+        } catch (FilesystemException $e) {
+            return false;
+        }
+
+        return true;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function removeListItem($name, $key)
     {
         $list = $this->getList($name);
-        foreach ($list as $i => $item) {
-            if ($item === $key) {
-                unset($list[$i]);
-            }
+        $list = array_filter($list, fn($item) => $item !== $key);
+
+        try {
+            $this->filesystem->write($this->getFilePath($name), serialize($list));
+        } catch (FilesystemException $e) {
+            return false;
         }
 
-        return $this->filesystem->update($this->getFilePath($name), serialize($list));
+        return true;
     }
 
-    /**
-     * @param $key
-     *
-     * @return bool
-     */
     private function forceClear($key)
     {
         try {
-            return $this->filesystem->delete($this->getFilePath($key));
-        } catch (FileNotFoundException $e) {
+            $this->filesystem->delete($this->getFilePath($key));
+        } catch (FilesystemException $e) {
             return true;
         }
+
+        return true;
     }
 }
