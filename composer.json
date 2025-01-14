@@ -1,5 +1,5 @@
 {
-    "name": "cache/filesystem-adapter",
+    "name": "reis/filesystem-adapter",
     "description": "A PSR-6 cache implementation using filesystem. This implementation supports tags",
     "license": "MIT",
     "type": "library",
